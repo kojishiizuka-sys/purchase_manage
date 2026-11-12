@@ -1,7 +1,7 @@
 /* 仕入れ・売価 アプリ本体 */
 'use strict';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const LS = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 保存できなくても動く */ } }
@@ -34,9 +34,9 @@ let histQuery = '', prodQuery = '', prodAll = false;
 function freshCalc(keep) {
   const k = keep || {};
   return {
-    mode: 'buy', editId: null, sendId: uid(),
+    mode: k.mode || 'voucher', editId: null, sendId: uid(),
     date: k.date || today(), code: '', q: '', sup: k.sup || '', tax: k.tax || '',
-    unit: '', qty: '', note: '', prices: {}, tN: null, tB: null, showB: false
+    unit: '', qty: '', note: '', ex: '', no: '', trial: '', prices: {}, tN: null, tB: null, showB: false
   };
 }
 
@@ -60,10 +60,10 @@ function targets(p) {
   return { N: tN, B: tB };
 }
 function baseTargets(p) { const c = cfg(); const N = p.tN != null ? p.tN : c.tN; return { N, B: p.tB != null ? p.tB : N - c.bDiff }; }
-function costOf(p, unit, tax) {
+function costOf(p, unit, tax, ex) {
   const c = cfg();
   if (!(unit > 0)) return null;
-  const b = tax === '税抜' ? unit * (1 + c.rate) : unit;
+  const b = (tax === '税抜' ? unit * (1 + c.rate) : unit) + (ex || 0);
   const k = b / (p.weight || c.defW);
   const w = p.kubun === '玄米' ? k * c.factor : k;
   return { b, k, w };
@@ -157,19 +157,217 @@ function renderWarn() {
   w.hidden = true;
 }
 
-/* ---------------- 計算・入力タブ ---------------- */
+/* ---------------- 伝票の入力 ---------------- */
+// 1枚の伝票＝共通部分（日付・仕入先・伝票No・税込/税抜）＋銘柄の行＋諸経費の行
+const UNIT_KG = { '俵': 60, 'kg': 1 };
+let V = freshVoucher();
+function freshVoucher(keep) {
+  const k = keep || {};
+  const v = { sendId: uid(), d: k.d || today(), s: k.s || '', no: '', t: k.t || '', unit: k.unit || '袋', lines: [], extras: [], other: '', total: '', force: false };
+  v.lines.push(newLine(v.unit));
+  return v;
+}
+function newLine(unit) { return { id: uid(), c: '', q: '', unit: unit || '袋', amt: '', label: '', search: '' }; }
+function lineBags(l) {
+  const p = prod(l.c), q = numIn(l.q);
+  if (!p || !(q > 0)) return null;
+  if (l.unit === '袋') return q;
+  return q * UNIT_KG[l.unit] / (p.weight || cfg().defW);
+}
+const taxIn = (a, rate, t) => t === '税抜' ? a * (1 + rate) : a;
+/** 伝票全体の計算。t を渡すと、その表記だったとしての計算 */
+function voucherCalc(t) {
+  t = t || V.t;
+  const c = cfg();
+  const lines = V.lines.map(l => ({ l, p: prod(l.c), bags: lineBags(l), amt: numIn(l.amt) }));
+  const ok = lines.filter(x => x.p && x.bags > 0 && x.amt > 0);
+  const totalBags = ok.reduce((s, x) => s + x.bags, 0);
+  const exTotal = V.extras.reduce((s, x) => s + (numIn(x.amt) > 0 ? taxIn(numIn(x.amt), x.rate, t) : 0), 0);
+  const exPer = totalBags > 0 ? exTotal / totalBags : 0;
+  const rice = ok.reduce((s, x) => s + taxIn(x.amt, c.rate, t), 0);
+  const other = numIn(V.other) > 0 ? taxIn(numIn(V.other), c.rate, t) : 0;
+  // 同じ商品はまとめる（1等・2等など）
+  const merged = [];
+  ok.forEach(x => {
+    let m = merged.find(y => y.p.code === x.p.code);
+    if (!m) { m = { p: x.p, bags: 0, amt: 0, parts: 0 }; merged.push(m); }
+    m.bags += x.bags; m.amt += x.amt; m.parts++;
+  });
+  merged.forEach(m => {
+    m.u = m.amt / m.bags; m.ex = exPer; m.b = taxIn(m.u, c.rate, t) + exPer;
+    const prev = prevEntry(m.p.code, V.d);
+    m.prev = prev;
+    if (prev) {
+      const same = prev.t === t && Math.abs(prev.u - m.u) < 0.5 && Math.abs((prev.ex || 0) - exPer) < 0.5;
+      m.df = same ? 0 : m.b - prev.b;
+      m.dfRice = (m.b - exPer) - (prev.b - (prev.ex || 0));
+      m.dfEx = exPer - (prev.ex || 0);
+    }
+  });
+  return { lines, ok, totalBags, exTotal, exPer, merged, total: rice + exTotal + other, count: ok.length };
+}
+function reconcile() {
+  const want = numIn(V.total);
+  if (!(want > 0) || !V.t) return null;
+  const cur = voucherCalc(), tol = Math.max(2, cur.count + V.extras.length);
+  const diff = cur.total - want;
+  if (Math.abs(diff) <= tol) return { ok: true, diff };
+  const other = V.t === '税込' ? '税抜' : '税込';
+  const alt = voucherCalc(other);
+  return { ok: false, diff, hint: Math.abs(alt.total - want) <= tol ? other : '' };
+}
+
+function renderVoucher() {
+  const el = $('#tab-calc');
+  const s = V.s ? sup(V.s) : null;
+  let h = modeSeg();
+  h += `<div class="card"><div class="row">
+      <div><label class="f">仕入日（出庫日・出荷日）</label><input class="t" type="date" id="vD" value="${esc(V.d)}"></div>
+      <div><label class="f">伝票No</label><input class="t" id="vNo" value="${esc(V.no)}" placeholder="なければ空欄"></div></div>
+    <label class="f">仕入先</label><select class="t" id="vS"><option value="">選んでください</option>${D.suppliers.slice().sort((a, b) => (b.last || '').localeCompare(a.last || '')).map(x => `<option value="${esc(x.id)}" ${V.s === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}<option value="__new">＋ 新しい仕入先を追加</option></select>
+    <label class="f">伝票の金額は</label>
+    <div class="seg" id="vT"><button data-vt="税込" class="${V.t === '税込' ? 'on' : ''}">税込</button><button data-vt="税抜" class="${V.t === '税抜' ? 'on' : ''}">税抜</button></div>
+    ${s && s.tax ? `<div class="muted">この仕入先はふだん「${esc(s.tax)}」です。請求額を入れると、合っているか確かめられます</div>` : ''}</div>`;
+  V.lines.forEach((l, i) => { h += lineCard(l, i); });
+  h += `<button class="btn sub" style="width:100%" data-act="addLine">＋ 銘柄を追加</button>
+    <div class="card" style="margin-top:10px"><h2>送料・倉庫代など</h2><div id="vEx">${V.extras.map(extraRow).join('')}</div>
+    <button class="linkbtn" data-act="addExtra">＋ 送料・倉庫代などを追加</button>
+    <div class="muted">米の袋数で割って、1袋ごとの原価に入れます</div></div>
+    <div class="card"><div class="row">
+      <div><label class="f">米以外の金額（記録しない）</label><div class="yen"><input class="t num" id="vOther" inputmode="numeric" value="${esc(V.other)}" placeholder="せんべい等"></div></div>
+      <div><label class="f">伝票の請求額（税込）</label><div class="yen"><input class="t num" id="vTotal" inputmode="numeric" value="${esc(V.total)}" placeholder="照合用"></div></div></div>
+      <div id="vSum"></div></div>
+    <div class="actions"><button class="btn sub" data-act="vClear">クリア</button><button class="btn" data-act="vRecord">記録する</button></div>`;
+  el.innerHTML = h;
+  V.lines.forEach(l => { if (!l.c) renderLineSearch(l); });
+  refreshVoucher();
+}
+function modeSeg() {
+  return `<div class="seg" style="margin-bottom:10px">
+    <button data-mode="voucher" class="${C.mode === 'voucher' ? 'on' : ''}">伝票を記録</button>
+    <button data-mode="price" class="${C.mode === 'price' ? 'on' : ''}">売価を見直す</button></div>`;
+}
+function lineCard(l, i) {
+  const p = l.c ? prod(l.c) : null;
+  let h = `<div class="card" data-lineid="${l.id}"><div class="row"><b class="grow">銘柄 ${i + 1}</b>${V.lines.length > 1 ? `<button class="linkbtn" data-ldel="${l.id}">この行を消す</button>` : ''}</div>`;
+  if (p) h += `<div class="pick"><b>${esc(p.name)}</b><span class="muted">${esc(p.kubun)}${p.weight && p.weight !== 30 ? '・' + p.weight + 'kg' : ''}</span><button data-lclear="${l.id}">変える</button></div>`;
+  else h += `<input class="t" data-lq="${l.id}" placeholder="商品名の一部（例：魚沼）" value="${esc(l.search)}" autocomplete="off"><div id="lr-${l.id}"></div>`;
+  h += `<div class="row" style="align-items:flex-end">
+      <div><label class="f">数量</label><input class="t num" data-lf="q" data-l="${l.id}" inputmode="decimal" value="${esc(l.q)}"></div>
+      <div><label class="f">単位</label><div class="seg">${['袋', '俵', 'kg'].map(u => `<button data-lunit="${u}" data-l="${l.id}" class="${l.unit === u ? 'on' : ''}">${u}</button>`).join('')}</div></div></div>
+    <div class="row">
+      <div><label class="f">金額（この行の合計）</label><div class="yen"><input class="t num" data-lf="amt" data-l="${l.id}" inputmode="numeric" value="${esc(l.amt)}"></div></div>
+      <div><label class="f">等級・特栽など</label><input class="t" data-lf="label" data-l="${l.id}" value="${esc(l.label)}" placeholder="1等、特栽"></div></div>
+    <div id="lo-${l.id}" class="muted" style="margin-top:6px"></div></div>`;
+  return h;
+}
+function extraRow(x, i) {
+  return `<div class="row" style="align-items:flex-end;margin-bottom:6px">
+    <div><label class="f">内容</label><input class="t" data-ef="name" data-e="${i}" value="${esc(x.name)}" list="exNames"></div>
+    <div><label class="f">金額</label><div class="yen"><input class="t num" data-ef="amt" data-e="${i}" inputmode="numeric" value="${esc(x.amt)}"></div></div>
+    <div style="flex:.8"><label class="f">税率</label><div class="seg">${[0.08, 0.1].map(r => `<button data-erate="${r}" data-e="${i}" class="${x.rate === r ? 'on' : ''}">${r * 100}%</button>`).join('')}</div></div>
+    <button class="linkbtn" style="flex:0" data-edel="${i}">✕</button></div>
+    <datalist id="exNames"><option>送料</option><option>倉庫代</option><option>チャーター便</option></datalist>`;
+}
+function renderLineSearch(l) {
+  const box = document.getElementById('lr-' + l.id); if (!box) return;
+  const q = norm(l.search);
+  const lastD = {}, supD = {};
+  D.entries.forEach(e => { if (!lastD[e.c] || lastD[e.c] < e.d) lastD[e.c] = e.d; if (e.s === V.s && (!supD[e.c] || supD[e.c] < e.d)) supD[e.c] = e.d; });
+  let list = D.products.slice().sort((a, b) => ((supD[b.code] || '').localeCompare(supD[a.code] || '')) || (onSale(b) - onSale(a)) || ((lastD[b.code] || '').localeCompare(lastD[a.code] || '')));
+  if (q) list = list.filter(p => norm(p.name).includes(q) || p.code === q || norm(p.rakuichi) === q);
+  else list = list.filter(p => supD[p.code] || onSale(p));
+  list = list.slice(0, q ? 30 : 12);
+  box.innerHTML = list.length ? '<div class="results">' + list.map(p =>
+    `<div data-pick="${l.id}" data-code="${esc(p.code)}">${esc(p.name)}<small>${supD[p.code] ? 'この仕入先 ' + supD[p.code] : onSale(p) ? '販売中' : ''}</small></div>`).join('') + '</div>'
+    : '<div class="muted" style="padding:8px">見つかりません。「商品」タブで追加できます</div>';
+}
+/** 入力のたびに、計算結果の部分だけを書き直す（入力欄は書き直さない） */
+function refreshVoucher() {
+  if (tab !== 'calc' || C.mode !== 'voucher' || C.editId) return;
+  const r = voucherCalc();
+  r.lines.forEach(x => {
+    const out = document.getElementById('lo-' + x.l.id); if (!out) return;
+    if (!x.p) { out.innerHTML = ''; return; }
+    let h = '';
+    if (x.bags > 0 && x.l.unit !== '袋') h += `<b>${fmt(numIn(x.l.q))}${x.l.unit} → ${fmt(x.bags)}袋</b>（1袋${x.p.weight || cfg().defW}kg）<br>`;
+    const m = r.merged.find(y => y.p.code === x.p.code);
+    if (m && V.t) {
+      if (m.parts > 1) h += `<span class="chip amber">同じ商品の行をまとめて平均します（${m.parts}行・${fmt(m.bags)}袋）</span><br>`;
+      h += `1袋の原価 <b style="font-size:17px;color:var(--ink)">${yen(m.b)}</b>${m.ex > 0 ? `（米 ${yen(m.b - m.ex)}＋諸経費 ${yen(m.ex)}）` : ''}`;
+      if (m.prev) h += '<br>' + diffText(m, m.prev);
+      else h += '<br>この商品の過去の仕入れはありません';
+    } else if (!V.t) h += '「伝票の金額は 税込／税抜」を選んでください';
+    out.innerHTML = h;
+  });
+  const sum = $('#vSum'); if (!sum) return;
+  let h = `<div class="muted" style="margin-top:8px">米 ${fmt(r.totalBags)}袋${r.exTotal > 0 ? `　諸経費 ${yen(r.exTotal)}（1袋 ${yen(r.exPer)}）` : ''}<br>計算した合計（税込）<b>${V.t ? yen(r.total) : '—'}</b></div>`;
+  const rc = reconcile();
+  if (rc) {
+    if (rc.ok) h += `<div class="alert same" style="color:var(--main)">✓ 請求額と合っています${Math.round(rc.diff) ? `（端数 ${signed(rc.diff)}円）` : ''}</div>`;
+    else h += `<div class="alert up">請求額と ${signed(rc.diff)}円 違います${rc.hint ? `<br>「${rc.hint}」として計算すると合います <button class="btn small" data-vt="${rc.hint}">${rc.hint}に切り替える</button>` : '<br>袋数・金額・送料などを確認してください'}</div>`;
+  }
+  sum.innerHTML = h;
+}
+const fmt = n => (Math.round(n * 100) / 100).toLocaleString('ja-JP');
+function diffText(m, prev) {
+  const ps = sup(prev.s);
+  let h = `前回 ${esc(prev.d)} ${esc(ps ? ps.name : '')} 1袋 ${yen(prev.b)}　`;
+  if (m.df === 0) return h + '<span class="chip gray">前回と同じ</span>';
+  h += `<span class="chip ${m.df > 0 ? 'red' : 'blue'}">${m.df > 0 ? '値上がり' : '値下がり'} ${signed(m.df)}円</span>`;
+  if (Math.abs(m.dfEx) >= 0.5) h += `<br><span class="muted">うち米代 ${signed(m.dfRice)}円・諸経費 ${signed(m.dfEx)}円</span>`;
+  return h;
+}
+function confirmVoucher() {
+  const r = voucherCalc();
+  const err = !V.s ? '仕入先を選んでください' : !V.t ? '税込か税抜かを選んでください' : !V.d ? '仕入日を入れてください'
+    : !r.ok.length ? '銘柄・数量・金額を入れてください'
+    : r.lines.some(x => x.l.c && !(x.bags > 0 && x.amt > 0)) ? '数量か金額が空の銘柄があります' : r.lines.some(x => !x.l.c && (x.l.q || x.l.amt)) ? '商品を選んでいない行があります' : '';
+  if (err) { toast(err, true); return; }
+  const dupNo = V.no && D.entries.find(e => e.s === V.s && e.no === V.no.trim());
+  const rc = reconcile();
+  let h = `<h2>この伝票を記録しますか？</h2><table class="sum">
+    <tr><td>仕入日</td><td>${esc(V.d)}</td></tr><tr><td>仕入先</td><td>${esc(sup(V.s).name)}</td></tr>
+    ${V.no ? `<tr><td>伝票No</td><td>${esc(V.no)}</td></tr>` : ''}<tr><td>金額の表記</td><td>${V.t}</td></tr></table>`;
+  r.merged.forEach(m => {
+    h += `<div class="card" style="margin-top:8px"><b>${esc(m.p.name)}</b>　${fmt(m.bags)}袋<br>1袋の原価 <b>${yen(m.b)}</b>${m.ex > 0 ? `（米 ${yen(m.b - m.ex)}＋諸経費 ${yen(m.ex)}）` : ''}<br>`;
+    h += m.prev ? diffText(m, m.prev) : 'はじめての仕入れ';
+    if (m.prev && m.prev.s !== V.s) h += `<br><span class="lo">前回の仕入先は ${esc((sup(m.prev.s) || {}).name || '')}（違っていないか確認）</span>`;
+    h += '</div>';
+  });
+  r.lines.filter(x => x.l.unit !== '袋' && x.bags > 0).forEach(x => { h += `<div class="muted">※ ${esc(x.p.name)}：${fmt(numIn(x.l.q))}${x.l.unit} → ${fmt(x.bags)}袋 に直しました</div>`; });
+  if (rc && !rc.ok) h += `<div class="alert up">請求額と ${signed(rc.diff)}円 違います。このまま記録してよいか確認してください</div>`;
+  else if (rc && rc.ok) h += '<div class="alert same" style="color:var(--main)">✓ 請求額と合っています</div>';
+  else h += '<div class="muted">請求額を入れていないため、照合していません</div>';
+  if (dupNo) h += `<label class="radio" style="border-color:var(--red)"><input type="checkbox" id="vForce">この伝票No は ${esc(dupNo.d)} に記録済みです。2ページ目など、同じ伝票の続きとして追加する</label>`;
+  if (r.merged.some(m => m.df)) h += '<div class="muted" style="margin-top:6px">値段が変わった商品は「見直し」タブに出ます。売価はそこで決めてください</div>';
+  h += '<div class="actions"><button class="btn sub" data-act="close">戻る</button><button class="btn" id="okVoucher">記録する</button></div>';
+  openModal(h);
+  $('#okVoucher').onclick = () => {
+    if (dupNo && !$('#vForce').checked) { toast('記録済みの伝票です。続きとして追加するなら、チェックを入れてください', true); return; }
+    const lastUnit = (r.ok.map(x => x.l.unit).find(u => u !== '袋')) || '袋';
+    const body = { sendId: V.sendId, v: { d: V.d, s: V.s, no: V.no.trim(), t: V.t, unit: lastUnit, force: !!dupNo,
+      lines: r.ok.map(x => ({ c: x.p.code, bags: x.bags, amt: x.amt, label: x.l.label + (x.l.unit !== '袋' ? (x.l.label ? ' ' : '') + fmt(numIn(x.l.q)) + x.l.unit : '') })),
+      extras: V.extras.filter(x => numIn(x.amt) > 0).map(x => ({ name: x.name || '諸経費', amt: numIn(x.amt), rate: x.rate })) } };
+    run(async () => {
+      const res = await api('addVoucher', body);
+      closeModal();
+      toast(res.dup ? 'すでに記録されていました' : `記録しました（${r.merged.length}件）`);
+      V = freshVoucher({ d: V.d });
+      render();
+    });
+  };
+}
+
+/* ---------------- 計算・入力タブ（売価の見直し・記録の修正） ---------------- */
 function renderCalc() {
+  if (!C.editId && C.mode === 'voucher') { renderVoucher(); return; }
   const el = $('#tab-calc');
   const p = C.code ? prod(C.code) : null;
   const isBuy = C.mode === 'buy';
   let h = '';
-  if (C.editId) {
-    h += `<div class="card"><b>入庫ID ${C.editId} を修正中</b> <button class="linkbtn" data-act="cancelEdit">やめる</button></div>`;
-  } else {
-    h += `<div class="seg" style="margin-bottom:10px">
-      <button data-mode="buy" class="${isBuy ? 'on' : ''}">仕入れを記録</button>
-      <button data-mode="price" class="${!isBuy ? 'on' : ''}">売価だけ見直す</button></div>`;
-  }
+  if (C.editId) h += `<div class="card"><b>入庫ID ${C.editId} を修正中</b> <button class="linkbtn" data-act="cancelEdit">やめる</button></div>`;
+  else h += modeSeg();
   h += '<div class="card">';
   if (isBuy) h += `<label class="f">仕入日</label><input class="t" type="date" id="cDate" value="${esc(C.date)}">`;
   h += '<label class="f">商品</label>';
@@ -187,7 +385,13 @@ function renderCalc() {
         <div><label class="f">1袋の単価</label><div class="yen"><input class="t num" id="cUnit" inputmode="decimal" value="${esc(C.unit)}" placeholder="0"></div></div>
         <div><label class="f">袋数</label><input class="t num" id="cQty" inputmode="decimal" value="${esc(C.qty)}" placeholder="計算だけなら空欄"></div>
       </div>
+      <div class="row">
+        <div><label class="f">1袋の諸経費（税込）</label><div class="yen"><input class="t num" id="cEx" inputmode="decimal" value="${esc(C.ex)}" placeholder="0"></div></div>
+        <div><label class="f">伝票No</label><input class="t" id="cNo" value="${esc(C.no)}"></div></div>
       <label class="f">備考</label><input class="t" id="cNote" value="${esc(C.note)}" placeholder="新米、一等 など">`;
+  } else if (p) {
+    h += `<label class="f">試算の原価（1袋・税込）</label><div class="yen"><input class="t num" id="cTrial" inputmode="decimal" value="${esc(C.trial)}" placeholder="空欄なら最新の仕入れ"></div>
+      <div class="muted">仕入れる前に、納品書の値段で売価を試算するときに使います（保存はされません）</div>`;
   }
   h += '</div><div id="cOut"></div>';
   el.innerHTML = h;
@@ -235,7 +439,8 @@ function selectProduct(code) {
 }
 
 function currentCost(p) {
-  if (C.mode === 'buy') return costOf(p, numIn(C.unit), C.tax);
+  if (C.mode === 'buy') return costOf(p, numIn(C.unit), C.tax, numIn(C.ex) || 0);
+  if (numIn(C.trial) > 0) { const c = costOf(p, numIn(C.trial), '税込'); c.trial = true; return c; }
   const last = prevEntry(p.code);
   return last ? { b: last.b, k: last.k, w: last.w, from: last } : null;
 }
@@ -253,13 +458,15 @@ function renderCalcOut() {
       : '<div class="muted">この商品の過去の仕入れはありません</div>';
     if (cost && prev) {
       const unit = numIn(C.unit);
-      const same = prev.t === C.tax && Math.abs(prev.u - unit) < 0.5;
+      const same = prev.t === C.tax && Math.abs(prev.u - unit) < 0.5 && Math.abs((prev.ex || 0) - (numIn(C.ex) || 0)) < 0.5;
       const d = same ? 0 : cost.b - prev.b;
       if (d === 0) h += `<div class="alert same">前回と同じ値段です</div>`;
       else h += `<div class="alert ${d > 0 ? 'up' : 'down'}">${d > 0 ? '⚠ 値上がり' : '⚠ 値下がり'}　1袋 <b>${signed(d)}円</b>（${d > 0 ? '+' : '−'}${Math.abs(d / prev.b * 100).toFixed(1)}%）<br>売価を見直すか確認してください</div>`;
     }
+  } else if (cost && cost.trial) {
+    h += '<div class="alert down">試算の原価で計算しています</div>';
   } else if (cost) {
-    h += `<div class="muted">原価は最新の仕入れ（${esc(cost.from.d)}　${esc((sup(cost.from.s) || {}).name || '')}）</div>`;
+    h += `<div class="muted">原価は最新の仕入れ（${esc(cost.from.d)}　${esc((sup(cost.from.s) || {}).name || '')}）${cost.from.ex ? '　諸経費 ' + yen(cost.from.ex) + '/袋 込み' : ''}</div>`;
   } else {
     h += '<div class="muted">この商品の仕入れの記録がないため、原価が分かりません</div>';
   }
@@ -322,6 +529,15 @@ document.addEventListener('input', ev => {
     return;
   }
   if (t.id === 'cQ') { C.q = t.value; renderSearch(); return; }
+  if (t.id === 'cEx') { C.ex = t.value; refreshOut(); return; }
+  if (t.id === 'cNo') { C.no = t.value; return; }
+  if (t.id === 'cTrial') { C.trial = t.value; refreshOut(); return; }
+  if (t.id === 'vNo') { V.no = t.value; return; }
+  if (t.id === 'vOther') { V.other = t.value; refreshVoucher(); return; }
+  if (t.id === 'vTotal') { V.total = t.value; refreshVoucher(); return; }
+  if (t.dataset.lq) { const l = V.lines.find(x => x.id === t.dataset.lq); l.search = t.value; renderLineSearch(l); return; }
+  if (t.dataset.lf) { const l = V.lines.find(x => x.id === t.dataset.l); l[t.dataset.lf] = t.value; refreshVoucher(); return; }
+  if (t.dataset.ef) { V.extras[Number(t.dataset.e)][t.dataset.ef] = t.value; refreshVoucher(); return; }
   if (t.id === 'cUnit') { C.unit = t.value; refreshOut(); return; }
   if (t.id === 'cQty') { C.qty = t.value; refreshOut(); return; }
   if (t.id === 'cNote') { C.note = t.value; return; }
@@ -336,6 +552,13 @@ document.addEventListener('input', ev => {
 document.addEventListener('change', ev => {
   const t = ev.target;
   if (t.id === 'cDate') { C.date = t.value; refreshOut(); }
+  if (t.id === 'vD') { V.d = t.value; refreshVoucher(); }
+  if (t.id === 'vS') {
+    if (t.value === '__new') { t.value = V.s; openNewSupplier(); return; }
+    V.s = t.value; const s = sup(V.s);
+    if (s) { if (s.tax) V.t = s.tax; V.unit = s.unit || '袋'; V.lines.forEach(l => { if (!l.q) l.unit = V.unit; }); }
+    renderVoucher();
+  }
   if (t.id === 'cSup') {
     if (t.value === '__new') { t.value = C.sup; openNewSupplier(); return; }
     C.sup = t.value; const s = sup(C.sup); if (s && s.tax) C.tax = s.tax; renderCalc();
@@ -352,17 +575,28 @@ function refreshTable() { refreshOut(); }
 document.addEventListener('click', async ev => {
   const t = ev.target.closest('button, [data-code], [data-entry], [data-prod], [data-review]');
   if (!t) return;
-  if (t.dataset.mode) { const keep = { date: C.date, sup: C.sup, tax: C.tax }; const code = C.code; C = freshCalc(keep); C.mode = t.dataset.mode; if (code) selectProduct(code); else renderCalc(); return; }
+  if (t.dataset.mode) { const code = C.code; C = freshCalc({ mode: t.dataset.mode }); if (code && C.mode === 'price') selectProduct(code); else renderCalc(); return; }
+  if (t.dataset.pick) { const l = V.lines.find(x => x.id === t.dataset.pick); l.c = t.dataset.code; l.search = ''; renderVoucher(); const q = document.querySelector(`[data-lf="q"][data-l="${l.id}"]`); if (q) q.focus(); return; }
+  if (t.dataset.lclear) { const l = V.lines.find(x => x.id === t.dataset.lclear); l.c = ''; renderVoucher(); return; }
+  if (t.dataset.ldel) { V.lines = V.lines.filter(x => x.id !== t.dataset.ldel); renderVoucher(); return; }
+  if (t.dataset.lunit) { const l = V.lines.find(x => x.id === t.dataset.l); l.unit = t.dataset.lunit; t.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === t)); refreshVoucher(); return; }
+  if (t.dataset.vt) { V.t = t.dataset.vt; renderVoucher(); return; }
+  if (t.dataset.erate) { V.extras[Number(t.dataset.e)].rate = Number(t.dataset.erate); t.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === t)); refreshVoucher(); return; }
+  if (t.dataset.edel) { V.extras.splice(Number(t.dataset.edel), 1); renderVoucher(); return; }
   if (t.dataset.code !== undefined && t.closest('#cRes')) { selectProduct(t.dataset.code); return; }
   if (t.dataset.tax) { C.tax = t.dataset.tax; t.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === t)); refreshOut(); return; }
   if (t.dataset.tp) { C.prices[t.dataset.tp] = t.dataset.v; refreshOut(); return; }
   if (t.dataset.entry) { startEdit(Number(t.dataset.entry)); return; }
   if (t.dataset.prod) { openProduct(t.dataset.prod); return; }
-  if (t.dataset.review) { const keep = { date: C.date, sup: C.sup, tax: C.tax }; C = freshCalc(keep); C.mode = 'price'; showTab('calc'); selectProduct(t.dataset.review); return; }
+  if (t.dataset.review) { C = freshCalc({ mode: 'price' }); showTab('calc'); selectProduct(t.dataset.review); return; }
   switch (t.dataset.act) {
     case 'clearProd': C.code = ''; C.prices = {}; renderCalc(); setTimeout(() => { const q = $('#cQ'); if (q) q.focus(); }, 0); break;
     case 'showB': C.showB = true; refreshOut(); break;
     case 'clear': C = freshCalc({ date: C.date, sup: C.sup, tax: C.tax }); renderCalc(); break;
+    case 'addLine': V.lines.push(newLine(V.unit)); renderVoucher(); break;
+    case 'addExtra': V.extras.push({ name: V.extras.length ? '倉庫代' : '送料', amt: '', rate: 0.1 }); renderVoucher(); break;
+    case 'vClear': V = freshVoucher({ d: V.d }); renderVoucher(); break;
+    case 'vRecord': confirmVoucher(); break;
     case 'cancelEdit': C = freshCalc(); renderCalc(); break;
     case 'record': confirmRecord(); break;
     case 'savePrice': confirmPrice(false); break;
@@ -441,7 +675,7 @@ function confirmPrice(keep) {
     await run(async () => {
       await api('decide', { code: p.code, entryId: last ? last.id : null, decision: keep ? '据え置き' : '見直し', prices: keep ? null : ch });
       closeModal(); toast(keep ? '確認済みにしました' : '売価を保存しました');
-      C = freshCalc({ date: C.date, sup: C.sup, tax: C.tax }); C.mode = 'price'; selectProduct(p.code);
+      C = freshCalc({ mode: 'price' }); selectProduct(p.code);
     });
   };
 }
@@ -457,7 +691,7 @@ async function run(fn) {
 function startEdit(id) {
   const e = D.entries.find(x => x.id === id); if (!e) return;
   C = freshCalc(); C.editId = id; C.mode = 'buy';
-  Object.assign(C, { date: e.d, code: e.c, sup: e.s, tax: e.t || '税込', unit: String(e.u == null ? '' : e.u), qty: String(e.q == null ? '' : e.q), note: e.n });
+  Object.assign(C, { date: e.d, code: e.c, sup: e.s, tax: e.t || '税込', unit: String(e.u == null ? '' : e.u), qty: String(e.q == null ? '' : e.q), note: e.n, ex: e.ex ? String(e.ex) : '', no: e.no || '' });
   showTab('calc');
 }
 async function saveEdit() {
@@ -467,7 +701,7 @@ async function saveEdit() {
   openModal(`<h2>入庫ID ${C.editId} を変更しますか？</h2><p>${esc(C.date)}　${esc(p.name)}<br>${qty}袋 × ${yen(unit)}（${C.tax}）　${esc(sup(C.sup).name)}</p>
     <div class="actions"><button class="btn sub" data-act="close">戻る</button><button class="btn" id="okEdit">変更する</button></div>`);
   $('#okEdit').onclick = () => run(async () => {
-    await api('editEntry', { id: C.editId, entry: { d: C.date, c: C.code, s: C.sup, q: qty, u: unit, t: C.tax, n: C.note } });
+    await api('editEntry', { id: C.editId, entry: { d: C.date, c: C.code, s: C.sup, q: qty, u: unit, t: C.tax, n: C.note, ex: numIn(C.ex) || 0, no: C.no } });
     closeModal(); toast('変更しました'); C = freshCalc(); showTab('history');
   });
 }
@@ -520,7 +754,7 @@ function renderHistoryList() {
     const df = e.df == null ? '' : e.df === 0 ? '<span class="chip gray">前回と同じ</span>' : `<span class="chip ${e.df > 0 ? 'red' : 'blue'}">前回比 ${signed(e.df)}円</span>`;
     const dc = e.dc ? `<span class="chip green">${esc(e.dc)}</span>` : '';
     return `<div class="card tap hist" data-entry="${e.id}"><div class="top-line"><b>${esc(p.name)}</b><span class="muted">${esc(e.d)}</span></div>
-      <div class="muted">${esc((sup(e.s) || {}).name || '')}　${e.q == null ? '' : e.q + '袋'} × ${yen(e.u)}（${esc(e.t)}）→ 1袋 ${yen(e.b)}</div>
+      <div class="muted">${esc((sup(e.s) || {}).name || '')}${e.no ? '　No.' + esc(e.no) : ''}　${e.q == null ? '' : fmt(e.q) + '袋'} × ${yen(e.u)}（${esc(e.t)}）${e.ex ? '＋諸経費 ' + yen(e.ex) : ''} → 1袋 ${yen(e.b)}</div>
       <div>${df}${dc}${e.n ? `<span class="chip gray">${esc(e.n)}</span>` : ''}</div></div>`;
   }).join('') : '<div class="empty">記録がありません</div>';
 }
@@ -585,7 +819,9 @@ function openNewSupplier() {
   $('#okSup').onclick = () => {
     const name = $('#s_name').value.trim(), tax = $('#s_tax').value;
     if (!name) { toast('仕入先名を入れてください', true); return; }
-    run(async () => { const r = await api('addSupplier', { supplier: { name, tax } }); closeModal(); C.sup = String(r.id); C.tax = tax; renderCalc(); toast(r.dup ? '同じ名前の仕入先がありました' : '追加しました'); });
+    run(async () => { const r = await api('addSupplier', { supplier: { name, tax } }); closeModal();
+      if (C.mode === 'voucher' && !C.editId) { V.s = String(r.id); V.t = tax; } else { C.sup = String(r.id); C.tax = tax; }
+      renderCalc(); toast(r.dup ? '同じ名前の仕入先がありました' : '追加しました'); });
   };
 }
 
