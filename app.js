@@ -1,7 +1,7 @@
 /* 仕入れ・売価 アプリ本体 */
 'use strict';
 
-const VERSION = '1.1.1';
+const VERSION = '1.2.1';
 const LS = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 保存できなくても動く */ } }
@@ -119,7 +119,7 @@ async function api(action, payload) {
   if (!res.ok) { setSync(''); if (res.auth) openSettings(); throw new Error(res.error || 'エラーが起きました'); }
   if (res.data) { D = res.data; LS.set('shiire-data', D); }
   const sec = ((Date.now() - t0) / 1000).toFixed(1);
-  lastTiming = { action, total: sec, server: res.ms != null ? (res.ms / 1000).toFixed(1) : '?' };
+  lastTiming = { action, total: sec, server: res.ms != null ? (res.ms / 1000).toFixed(1) : '?', prof: res.prof || null };
   setSync('最新 ' + (D && D.serverTime ? D.serverTime.slice(11) : '') + (action !== 'load' ? `（${sec}秒）` : ''));
   return res;
 }
@@ -166,11 +166,12 @@ const UNIT_KG = { '俵': 60, 'kg': 1 };
 let V = freshVoucher();
 function freshVoucher(keep) {
   const k = keep || {};
-  const v = { sendId: uid(), d: k.d || today(), s: k.s || '', no: '', t: k.t || '', unit: k.unit || '袋', lines: [], extras: [], other: '', total: '', force: false };
+  const v = { sendId: uid(), d: k.d || today(), s: k.s || '', no: '', t: k.t || '', unit: k.unit || '袋', lines: [], extras: [], other: '', total: '', force: false,
+    others: [], photos: k.photos || null, readNote: '', showPhoto: false };
   v.lines.push(newLine(v.unit));
   return v;
 }
-function newLine(unit) { return { id: uid(), c: '', q: '', unit: unit || '袋', amt: '', label: '', search: '' }; }
+function newLine(unit) { return { id: uid(), c: '', q: '', unit: unit || '袋', amt: '', label: '', search: '', raw: '', match: '' }; }
 function lineBags(l) {
   const p = prod(l.c), q = numIn(l.q);
   if (!p || !(q > 0)) return null;
@@ -224,6 +225,12 @@ function renderVoucher() {
   const el = $('#tab-calc');
   const s = V.s ? sup(V.s) : null;
   let h = modeSeg();
+  h += `<div class="card"><button class="btn" style="width:100%" data-act="photo">📷 伝票の写真から読み取る</button>
+    <input type="file" id="photoIn" accept="image/*" multiple hidden>
+    <div class="muted" style="margin-top:6px">2ページある伝票は、まとめて選んでください（6枚まで）。読み取った内容は下書きなので、必ず確認してから記録します</div>
+    ${V.readNote ? `<div class="alert down" style="margin-top:8px">${V.readNote}</div>` : ''}
+    ${V.photos ? `<button class="linkbtn" data-act="togglePhoto">${V.showPhoto ? '写真を閉じる' : '📄 写真を見ながら確認する'}</button>${V.showPhoto ? V.photos.map(u => `<img src="${u}" style="width:100%;border-radius:8px;margin-top:6px">`).join('') : ''}` : ''}
+    ${QUEUE.length ? `<div class="chip amber">この請求書には、あと ${QUEUE.length} 件の納品があります。記録すると次を表示します</div>` : ''}</div>`;
   h += `<div class="card"><div class="row">
       <div><label class="f">仕入日（出庫日・出荷日）</label><input class="t" type="date" id="vD" value="${esc(V.d)}"></div>
       <div><label class="f">伝票No</label><input class="t" id="vNo" value="${esc(V.no)}" placeholder="なければ空欄"></div></div>
@@ -236,7 +243,7 @@ function renderVoucher() {
     <div class="card" style="margin-top:10px"><h2>送料・倉庫代など</h2><div id="vEx">${V.extras.map(extraRow).join('')}</div>
     <button class="linkbtn" data-act="addExtra">＋ 送料・倉庫代などを追加</button>
     <div class="muted">米の袋数で割って、1袋ごとの原価に入れます</div></div>
-    <div class="card"><div class="row">
+    <div class="card">${V.others.length ? `<div class="muted">米以外として外した行：${V.others.map((o, i) => `<span class="chip gray">${esc(o.raw)} ${yen(o.amt)} <button class="linkbtn" data-oback="${i}">米の行にする</button></span>`).join('')}</div>` : ''}<div class="row">
       <div><label class="f">米以外の金額（記録しない）</label><div class="yen"><input class="t num" id="vOther" inputmode="numeric" value="${esc(V.other)}" placeholder="せんべい等"></div></div>
       <div><label class="f">伝票の請求額（税込）</label><div class="yen"><input class="t num" id="vTotal" inputmode="numeric" value="${esc(V.total)}" placeholder="照合用"></div></div></div>
       <div id="vSum"></div></div>
@@ -253,6 +260,7 @@ function modeSeg() {
 function lineCard(l, i) {
   const p = l.c ? prod(l.c) : null;
   let h = `<div class="card" data-lineid="${l.id}"><div class="row"><b class="grow">銘柄 ${i + 1}</b>${V.lines.length > 1 ? `<button class="linkbtn" data-ldel="${l.id}">この行を消す</button>` : ''}</div>`;
+  if (l.raw) h += `<div class="muted">伝票の品名：「${esc(l.raw)}」${l.c ? (l.match === '対応表' ? '<span class="chip green">前回の対応</span>' : '<span class="chip amber">AIの推定・確認してください</span>') : '<span class="chip red">商品を選んでください</span>'}</div>`;
   if (p) h += `<div class="pick"><b>${esc(p.name)}</b><span class="muted">${esc(p.kubun)}${p.weight && p.weight !== 30 ? '・' + p.weight + 'kg' : ''}</span><button data-lclear="${l.id}">変える</button></div>`;
   else h += `<input class="t" data-lq="${l.id}" placeholder="商品名の一部（例：魚沼）" value="${esc(l.search)}" autocomplete="off"><div id="lr-${l.id}"></div>`;
   h += `<div class="row" style="align-items:flex-end">
@@ -278,8 +286,11 @@ function renderLineSearch(l) {
   const lastD = {}, supD = {};
   D.entries.forEach(e => { if (!lastD[e.c] || lastD[e.c] < e.d) lastD[e.c] = e.d; if (e.s === V.s && (!supD[e.c] || supD[e.c] < e.d)) supD[e.c] = e.d; });
   let list = D.products.slice().sort((a, b) => ((supD[b.code] || '').localeCompare(supD[a.code] || '')) || (onSale(b) - onSale(a)) || ((lastD[b.code] || '').localeCompare(lastD[a.code] || '')));
-  if (q) list = list.filter(p => norm(p.name).includes(q) || p.code === q || norm(p.rakuichi) === q);
-  else list = list.filter(p => supD[p.code] || onSale(p));
+  if (q) {
+    const hit = list.filter(p => norm(p.name).includes(q) || p.code === q || norm(p.rakuichi) === q);
+    // 完全に含まれなくても、似ている商品を出す（例：「北海道ゆめぴ」→「北海道産ゆめぴりか」）
+    list = hit.length ? hit : list.map(p => ({ p, sc: similar(q, norm(p.name)) })).filter(x => x.sc >= 0.4).sort((a, b) => b.sc - a.sc).map(x => x.p);
+  } else list = list.filter(p => supD[p.code] || onSale(p));
   list = list.slice(0, q ? 30 : 12);
   box.innerHTML = list.length ? '<div class="results">' + list.map(p =>
     `<div data-pick="${l.id}" data-code="${esc(p.code)}">${esc(p.name)}<small>${supD[p.code] ? 'この仕入先 ' + supD[p.code] : onSale(p) ? '販売中' : ''}</small></div>`).join('') + '</div>'
@@ -321,6 +332,87 @@ function diffText(m, prev) {
   if (Math.abs(m.dfEx) >= 0.5) h += `<br><span class="muted">うち米代 ${signed(m.dfRice)}円・諸経費 ${signed(m.dfEx)}円</span>`;
   return h;
 }
+/* ---- 写真から読み取る ---- */
+let QUEUE = [];   // 請求書に複数の納品があるとき、残りの納品
+function resizeImage(file, max) {
+  return new Promise((ok, ng) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const im = new Image();
+      im.onload = () => {
+        const k = Math.min(1, max / Math.max(im.width, im.height));
+        const cv = document.createElement('canvas'); cv.width = Math.round(im.width * k); cv.height = Math.round(im.height * k);
+        cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+        ok(cv.toDataURL('image/jpeg', 0.85));
+      };
+      im.onerror = () => ng(new Error('写真を開けませんでした'));
+      im.src = fr.result;
+    };
+    fr.onerror = () => ng(new Error('写真を読めませんでした'));
+    fr.readAsDataURL(file);
+  });
+}
+async function readPhotos(files) {
+  if (!files.length) return;
+  if (files.length > 6) { toast('写真は6枚までにしてください', true); return; }
+  openModal('<h2>読み取り中…</h2><p>10〜30秒ほどかかります。この画面のままお待ちください</p>');
+  busy = true;
+  try {
+    const urls = [];
+    for (const f of files) urls.push(await resizeImage(f, 2000));
+    const t0 = Date.now();
+    const res = await api('readVoucher', { images: urls.map(u => ({ type: 'image/jpeg', data: u.split(',')[1] })) });
+    const ds = res.read.deliveries || [];
+    closeModal();
+    if (!ds.length) { toast('伝票の明細を読み取れませんでした。明るい所で、伝票全体が写るように撮り直してください', true); return; }
+    const sec = ((Date.now() - t0) / 1000).toFixed(0);
+    lastTiming = { action: '写真の読み取り', total: sec, server: res.usage.sec + '（AI）', yen: res.usage.yen };
+    QUEUE = ds.slice(1).map((d, i) => ({ read: res.read, idx: i + 1 }));
+    applyRead(res.read, 0, urls);
+    render();
+    toast(`読み取りました（${sec}秒・約${res.usage.yen.toFixed(1)}円）`);
+  } catch (e) { closeModal(); toast(e.message, true); } finally { busy = false; }
+}
+/** 読み取り結果を、伝票の入力欄に入れる（下書き） */
+function applyRead(read, idx, photos) {
+  const d = read.deliveries[idx], s = sup(read.supplier_id);
+  V = freshVoucher({ photos });
+  V.d = /^\d{4}-\d{2}-\d{2}$/.test(d.date || '') ? d.date : today();
+  V.s = s ? s.id : '';
+  V.t = read.amounts_tax === '税込' || read.amounts_tax === '税抜' ? read.amounts_tax : ((s && s.tax) || '');
+  V.no = d.doc_no || '';
+  V.total = d.total_tax_included > 0 ? String(d.total_tax_included) : '';
+  V.lines = []; V.extras = []; V.others = [];
+  (d.lines || []).forEach(x => {
+    if (x.kind === '諸経費') { V.extras.push({ name: x.name, amt: x.amount > 0 ? String(x.amount) : '', rate: x.tax_rate === 8 ? 0.08 : 0.1 }); return; }
+    if (x.kind === '米以外') { V.others.push({ raw: x.name, amt: x.amount || 0 }); return; }
+    const l = newLine(['袋', '俵', 'kg'].includes(x.unit) ? x.unit : '袋');
+    Object.assign(l, { c: x.product_code && prod(x.product_code) ? x.product_code : '', q: x.qty > 0 ? String(x.qty) : '', amt: x.amount > 0 ? String(x.amount) : '',
+      label: x.label || '', raw: x.name, match: x.match || '' });
+    if (!l.c) l.search = guessSearch(x.name);
+    V.lines.push(l);
+  });
+  if (!V.lines.length) V.lines.push(newLine());
+  V.other = V.others.length ? String(V.others.reduce((a, o) => a + (o.amt || 0), 0)) : '';
+  const notes = [];
+  notes.push(`写真から読み取りました${read.deliveries.length > 1 ? `（${idx + 1}/${read.deliveries.length}件目の納品）` : ''}。数量・金額・商品を写真と見比べてください`);
+  if (!s) notes.push(`仕入先「${esc(read.supplier_name || '不明')}」が一覧にありません。選ぶか追加してください`);
+  if (read.amounts_tax === '不明') notes.push('税込か税抜か読み取れませんでした。請求額との照合で確かめてください');
+  if (!V.total) notes.push('この納品の請求額が書かれていないため、照合はできません');
+  V.readNote = notes.join('<br>');
+  C = freshCalc(); tab = 'calc';
+}
+/** 2文字ずつの組がどれだけ共通するか（0〜1） */
+function similar(a, b) {
+  const g = s => { const o = new Set(); for (let i = 0; i < s.length - 1; i++) o.add(s.slice(i, i + 2)); return o; };
+  const A = g(a), B = g(b); if (!A.size) return 0;
+  let n = 0; A.forEach(x => { if (B.has(x)) n++; }); return n / A.size;
+}
+/** 商品が決まらなかった行の検索欄に入れる言葉（年産・重さ・等級を除く） */
+function guessSearch(name) {
+  return String(name || '').normalize('NFKC').replace(/(令和|R)?\d{1,2}年産?/g, '').replace(/\d+\s*kg/gi, '').replace(/[1-3]等|【.*?】|\(.*?\)|（.*?）|検査|特栽米?|玄米|精米/g, '').replace(/\s+/g, ' ').trim().split(' ').pop().slice(0, 6);
+}
+
 function confirmVoucher() {
   const r = voucherCalc();
   const err = !V.s ? '仕入先を選んでください' : !V.t ? '税込か税抜かを選んでください' : !V.d ? '仕入日を入れてください'
@@ -351,12 +443,14 @@ function confirmVoucher() {
     const lastUnit = (r.ok.map(x => x.l.unit).find(u => u !== '袋')) || '袋';
     const body = { sendId: V.sendId, v: { d: V.d, s: V.s, no: V.no.trim(), t: V.t, unit: lastUnit, force: !!dupNo,
       lines: r.ok.map(x => ({ c: x.p.code, bags: x.bags, amt: x.amt, label: x.l.label + (x.l.unit !== '袋' ? (x.l.label ? ' ' : '') + fmt(numIn(x.l.q)) + x.l.unit : '') })),
-      extras: V.extras.filter(x => numIn(x.amt) > 0).map(x => ({ name: x.name || '諸経費', amt: numIn(x.amt), rate: x.rate })) } };
+      extras: V.extras.filter(x => numIn(x.amt) > 0).map(x => ({ name: x.name || '諸経費', amt: numIn(x.amt), rate: x.rate })),
+      learn: r.ok.filter(x => x.l.raw).map(x => ({ raw: x.l.raw, kind: '米', c: x.p.code })).concat(V.others.map(o => ({ raw: o.raw, kind: '米以外' }))) } };
     run(async () => {
       const res = await api('addVoucher', body);
       closeModal();
       toast(res.dup ? 'すでに記録されていました' : `記録しました（${r.merged.length}件）`);
-      V = freshVoucher({ d: V.d });
+      if (QUEUE.length) { const q = QUEUE.shift(); applyRead(q.read, q.idx, V.photos); }
+      else V = freshVoucher({ d: V.d });
       render();
     });
   };
@@ -556,6 +650,7 @@ document.addEventListener('change', ev => {
   const t = ev.target;
   if (t.id === 'cDate') { C.date = t.value; refreshOut(); }
   if (t.id === 'vD') { V.d = t.value; refreshVoucher(); }
+  if (t.id === 'photoIn') { const fs = [...t.files]; t.value = ''; readPhotos(fs); }
   if (t.id === 'vS') {
     if (t.value === '__new') { t.value = V.s; openNewSupplier(); return; }
     V.s = t.value; const s = sup(V.s);
@@ -586,6 +681,12 @@ document.addEventListener('click', async ev => {
   if (t.dataset.vt) { V.t = t.dataset.vt; renderVoucher(); return; }
   if (t.dataset.erate) { V.extras[Number(t.dataset.e)].rate = Number(t.dataset.erate); t.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === t)); refreshVoucher(); return; }
   if (t.dataset.edel) { V.extras.splice(Number(t.dataset.edel), 1); renderVoucher(); return; }
+  if (t.dataset.oback) {
+    const o = V.others.splice(Number(t.dataset.oback), 1)[0];
+    const l = newLine(V.unit); Object.assign(l, { raw: o.raw, amt: String(o.amt || ''), search: guessSearch(o.raw) }); V.lines.push(l);
+    V.other = V.others.length ? String(V.others.reduce((a, x) => a + (x.amt || 0), 0)) : '';
+    renderVoucher(); return;
+  }
   if (t.dataset.code !== undefined && t.closest('#cRes')) { selectProduct(t.dataset.code); return; }
   if (t.dataset.tax) { C.tax = t.dataset.tax; t.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === t)); refreshOut(); return; }
   if (t.dataset.tp) { C.prices[t.dataset.tp] = t.dataset.v; refreshOut(); return; }
@@ -598,8 +699,10 @@ document.addEventListener('click', async ev => {
     case 'clear': C = freshCalc({ date: C.date, sup: C.sup, tax: C.tax }); renderCalc(); break;
     case 'addLine': V.lines.push(newLine(V.unit)); renderVoucher(); break;
     case 'addExtra': V.extras.push({ name: V.extras.length ? '倉庫代' : '送料', amt: '', rate: 0.1 }); renderVoucher(); break;
-    case 'vClear': V = freshVoucher({ d: V.d }); renderVoucher(); break;
+    case 'vClear': V = freshVoucher({ d: V.d }); QUEUE = []; renderVoucher(); break;
     case 'vRecord': confirmVoucher(); break;
+    case 'photo': $('#photoIn').click(); break;
+    case 'togglePhoto': V.showPhoto = !V.showPhoto; renderVoucher(); break;
     case 'cancelEdit': C = freshCalc(); renderCalc(); break;
     case 'record': confirmRecord(); break;
     case 'savePrice': confirmPrice(false); break;
@@ -839,7 +942,8 @@ function openSettings() {
     <label class="f">合言葉</label><input class="t" id="st_pass" value="${esc(conf.pass || '')}" inputmode="numeric">
     <label class="f">あなたの名前（記録に残ります）</label><input class="t" id="st_name" value="${esc(conf.name || '')}">
     <p class="muted">最終バックアップ：${esc((D && D.lastBackup) || 'まだありません')}<br>バージョン ${VERSION}
-    ${lastTiming ? `<br>直前の通信（${esc(lastTiming.action)}）：全体 ${lastTiming.total}秒、うちサーバーの処理 ${lastTiming.server}秒` : ''}</p>
+    ${lastTiming ? `<br>直前の通信（${esc(lastTiming.action)}）：全体 ${lastTiming.total}秒、うちサーバーの処理 ${lastTiming.server}秒${lastTiming.yen != null ? `、AIの費用の目安 約${lastTiming.yen}円` : ''}` : ''}
+    ${lastTiming && lastTiming.prof ? '<br>サーバーの内訳：' + lastTiming.prof.map((x, i, a) => `${esc(x[0])} ${((x[1] - (i ? a[i - 1][1] : 0)) / 1000).toFixed(1)}`).join('／') + '秒' : ''}</p>
     <div class="actions"><button class="btn sub" data-act="close">閉じる</button><button class="btn" id="okSet">保存して読み込む</button></div>`);
   $('#okSet').onclick = () => {
     conf.apiUrl = $('#st_url').value.trim(); conf.pass = $('#st_pass').value.trim(); conf.name = $('#st_name').value.trim();
