@@ -1,7 +1,7 @@
 /* 仕入れ・売価 アプリ本体 */
 'use strict';
 
-const VERSION = '1.2.2';
+const VERSION = '1.2.4';
 const LS = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 保存できなくても動く */ } }
@@ -225,9 +225,12 @@ function renderVoucher() {
   const el = $('#tab-calc');
   const s = V.s ? sup(V.s) : null;
   let h = modeSeg();
-  h += `<div class="card"><button class="btn" style="width:100%" data-act="photo">📷 伝票の写真から読み取る</button>
+  h += `<div class="card">${PEND.length ? pendBox() : `<div class="row">
+      <button class="btn" data-act="camera">📷 カメラで撮る</button>
+      <button class="btn sub" data-act="photo">🖼 保存した写真から</button></div>`}
     <input type="file" id="photoIn" accept="image/*" multiple hidden>
-    <div class="muted" style="margin-top:6px">2ページある伝票は、まとめて選んでください（6枚まで）。読み取った内容は下書きなので、必ず確認してから記録します</div>
+    <input type="file" id="cameraIn" accept="image/*" capture="environment" hidden>
+    <div class="muted" style="margin-top:6px">伝票全体が写るように撮ってください。2ページある伝票は続けて撮るか、まとめて選びます（6枚まで）。読み取った内容は下書きなので、必ず確認してから記録します</div>
     ${V.readNote ? `<div class="alert down" style="margin-top:8px">${V.readNote}</div>` : ''}
     ${V.photos ? `<button class="linkbtn" data-act="togglePhoto">${V.showPhoto ? '写真を閉じる' : '📄 写真を見ながら確認する'}</button>${V.showPhoto ? V.photos.map(u => `<img src="${u}" style="width:100%;border-radius:8px;margin-top:6px">`).join('') : ''}` : ''}
     ${QUEUE.length ? `<div class="chip amber">この請求書には、あと ${QUEUE.length} 件の納品があります。記録すると次を表示します</div>` : ''}</div>`;
@@ -334,6 +337,13 @@ function diffText(m, prev) {
 }
 /* ---- 写真から読み取る ---- */
 let QUEUE = [];   // 請求書に複数の納品があるとき、残りの納品
+let PEND = [];    // カメラで撮って、まだ送っていない写真（2ページ目を撮るため）
+function pendBox() {
+  return `<b>撮った写真 ${PEND.length}枚</b><div class="row" style="flex-wrap:wrap;margin:6px 0">${PEND.map((u, i) =>
+    `<div style="flex:0 0 72px;position:relative"><img src="${u}" style="width:72px;height:96px;object-fit:cover;border-radius:6px;border:1px solid var(--line)"><button class="linkbtn" style="position:absolute;top:-6px;right:-2px;background:#fff;border-radius:50%;padding:0 6px" data-pdel="${i}">✕</button></div>`).join('')}</div>
+    <div class="row"><button class="btn sub" data-act="camera">📷 もう1ページ撮る</button><button class="btn" data-act="readPend">この写真で読み取る</button></div>
+    <button class="linkbtn" data-act="clearPend">撮り直す（写真を消す）</button>`;
+}
 function resizeImage(file, max) {
   return new Promise((ok, ng) => {
     const fr = new FileReader();
@@ -359,7 +369,7 @@ async function readPhotos(files) {
   busy = true;
   try {
     const urls = [];
-    for (const f of files) urls.push(await resizeImage(f, 2000));
+    for (const f of files) urls.push(typeof f === 'string' ? f : await resizeImage(f, 2000));
     const t0 = Date.now();
     const res = await api('readVoucher', { images: urls.map(u => ({ type: 'image/jpeg', data: u.split(',')[1] })) });
     const ds = res.read.deliveries || [];
@@ -368,6 +378,7 @@ async function readPhotos(files) {
     const sec = ((Date.now() - t0) / 1000).toFixed(0);
     lastTiming = { action: '写真の読み取り', total: sec, server: res.usage.sec + '（AI）', yen: res.usage.yen };
     QUEUE = ds.slice(1).map((d, i) => ({ read: res.read, idx: i + 1 }));
+    PEND = [];
     applyRead(res.read, 0, urls);
     render();
     toast(`読み取りました（${sec}秒・約${res.usage.yen.toFixed(1)}円）`);
@@ -393,9 +404,21 @@ function applyRead(read, idx, photos) {
     V.lines.push(l);
   });
   if (!V.lines.length) V.lines.push(newLine());
+  // 単位の確かめ：送料などの袋数が、米の数量の合計の2倍なら、米は「俵」で書かれている（1俵＝2袋）
+  const unitNotes = [];
+  const riceRead = (d.lines || []).filter(x => x.kind === '米');
+  const riceQty = riceRead.reduce((a, x) => a + (x.qty || 0), 0);
+  const exBags = (d.lines || []).filter(x => x.kind === '諸経費' && x.unit === '袋' && x.qty > 0).map(x => x.qty);
+  if (riceQty > 0 && V.lines.every(l => l.unit === '袋') && exBags.some(q => Math.abs(q - riceQty * 2) < 0.01)) {
+    V.lines.forEach(l => { l.unit = '俵'; });
+    unitNotes.push(`送料などが ${fmt(riceQty * 2)}袋 なので、米の数量 ${fmt(riceQty)} は「俵」と判断しました（${fmt(riceQty)}俵＝${fmt(riceQty * 2)}袋）`);
+  }
+  riceRead.forEach(x => { if (x.unitFrom === '対応表') unitNotes.push(`「${esc(x.name)}」の単位は、前回の対応から「${esc(x.unit)}」にしました（読み取りは「${esc(x.unitRead)}」）`); });
+  if (s && s.unit && s.unit !== '袋' && V.lines.some(l => l.unit === '袋' && l.raw)) unitNotes.push(`この仕入先はふだん「${esc(s.unit)}」です。単位が「袋」で合っているか確認してください`);
   V.other = V.others.length ? String(V.others.reduce((a, o) => a + (o.amt || 0), 0)) : '';
   const notes = [];
   notes.push(`写真から読み取りました${read.deliveries.length > 1 ? `（${idx + 1}/${read.deliveries.length}件目の納品）` : ''}。数量・金額・商品を写真と見比べてください`);
+  notes.push(...unitNotes);
   if (!s) notes.push(`仕入先「${esc(read.supplier_name || '不明')}」が一覧にありません。選ぶか追加してください`);
   if (read.amounts_tax === '不明') notes.push('税込か税抜か読み取れませんでした。請求額との照合で確かめてください');
   if (!V.total) notes.push('この納品の請求額が書かれていないため、照合はできません');
@@ -444,7 +467,7 @@ function confirmVoucher() {
     const body = { sendId: V.sendId, v: { d: V.d, s: V.s, no: V.no.trim(), t: V.t, unit: lastUnit, force: !!dupNo,
       lines: r.ok.map(x => ({ c: x.p.code, bags: x.bags, amt: x.amt, label: x.l.label + (x.l.unit !== '袋' ? (x.l.label ? ' ' : '') + fmt(numIn(x.l.q)) + x.l.unit : '') })),
       extras: V.extras.filter(x => numIn(x.amt) > 0).map(x => ({ name: x.name || '諸経費', amt: numIn(x.amt), rate: x.rate })),
-      learn: r.ok.filter(x => x.l.raw).map(x => ({ raw: x.l.raw, kind: '米', c: x.p.code })).concat(V.others.map(o => ({ raw: o.raw, kind: '米以外' }))) } };
+      learn: r.ok.filter(x => x.l.raw).map(x => ({ raw: x.l.raw, kind: '米', c: x.p.code, unit: x.l.unit })).concat(V.others.map(o => ({ raw: o.raw, kind: '米以外' }))) } };
     run(async () => {
       const res = await api('addVoucher', body);
       closeModal();
@@ -651,6 +674,10 @@ document.addEventListener('change', ev => {
   if (t.id === 'cDate') { C.date = t.value; refreshOut(); }
   if (t.id === 'vD') { V.d = t.value; refreshVoucher(); }
   if (t.id === 'photoIn') { const fs = [...t.files]; t.value = ''; readPhotos(fs); }
+  if (t.id === 'cameraIn' && t.files[0]) {
+    const f = t.files[0]; t.value = '';
+    resizeImage(f, 2000).then(u => { PEND.push(u); renderVoucher(); window.scrollTo(0, 0); }).catch(e => toast(e.message, true));
+  }
   if (t.id === 'vS') {
     if (t.value === '__new') { t.value = V.s; openNewSupplier(); return; }
     V.s = t.value; const s = sup(V.s);
@@ -681,6 +708,7 @@ document.addEventListener('click', async ev => {
   if (t.dataset.vt) { V.t = t.dataset.vt; renderVoucher(); return; }
   if (t.dataset.erate) { V.extras[Number(t.dataset.e)].rate = Number(t.dataset.erate); t.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === t)); refreshVoucher(); return; }
   if (t.dataset.edel) { V.extras.splice(Number(t.dataset.edel), 1); renderVoucher(); return; }
+  if (t.dataset.pdel) { PEND.splice(Number(t.dataset.pdel), 1); renderVoucher(); return; }
   if (t.dataset.oback) {
     const o = V.others.splice(Number(t.dataset.oback), 1)[0];
     const l = newLine(V.unit); Object.assign(l, { raw: o.raw, amt: String(o.amt || ''), search: guessSearch(o.raw) }); V.lines.push(l);
@@ -702,6 +730,9 @@ document.addEventListener('click', async ev => {
     case 'vClear': V = freshVoucher({ d: V.d }); QUEUE = []; renderVoucher(); break;
     case 'vRecord': confirmVoucher(); break;
     case 'photo': $('#photoIn').click(); break;
+    case 'camera': if (PEND.length >= 6) { toast('写真は6枚までです', true); break; } $('#cameraIn').click(); break;
+    case 'readPend': readPhotos(PEND.slice()); break;
+    case 'clearPend': PEND = []; renderVoucher(); break;
     case 'togglePhoto': V.showPhoto = !V.showPhoto; renderVoucher(); break;
     case 'cancelEdit': C = freshCalc(); renderCalc(); break;
     case 'record': confirmRecord(); break;
