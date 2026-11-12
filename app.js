@@ -1,7 +1,7 @@
 /* 仕入れ・売価 アプリ本体 */
 'use strict';
 
-const VERSION = '1.2.4';
+const VERSION = '1.3.0';
 const LS = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 保存できなくても動く */ } }
@@ -31,6 +31,9 @@ let C = freshCalc();                   // 計算・入力タブの入力中の�
 let busy = false;
 let lastTiming = null;               // 直前の通信にかかった時間（遅いときの原因調べ用）
 let histQuery = '', prodQuery = '', prodAll = false;
+// 期間で集計（履歴タブ）
+let histMode = 'list';
+const SUM = { from: '', to: '', q: '', by: 'prod', open: {} };
 
 function freshCalc(keep) {
   const k = keep || {};
@@ -645,6 +648,7 @@ document.addEventListener('input', ev => {
   const t = ev.target;
   if (tab !== 'calc') {
     if (t.id === 'hQ') { histQuery = t.value; renderHistoryList(); }
+    if (t.id === 'sQ') { SUM.q = t.value; renderSummary(); }
     if (t.id === 'pQ') { prodQuery = t.value; renderProductList(); }
     return;
   }
@@ -672,6 +676,7 @@ document.addEventListener('input', ev => {
 document.addEventListener('change', ev => {
   const t = ev.target;
   if (t.id === 'cDate') { C.date = t.value; refreshOut(); }
+  if (t.id === 'sFrom' || t.id === 'sTo') { SUM[t.id === 'sFrom' ? 'from' : 'to'] = t.value; renderSummary(); }
   if (t.id === 'vD') { V.d = t.value; refreshVoucher(); }
   if (t.id === 'photoIn') { const fs = [...t.files]; t.value = ''; readPhotos(fs); }
   if (t.id === 'cameraIn' && t.files[0]) {
@@ -708,6 +713,10 @@ document.addEventListener('click', async ev => {
   if (t.dataset.vt) { V.t = t.dataset.vt; renderVoucher(); return; }
   if (t.dataset.erate) { V.extras[Number(t.dataset.e)].rate = Number(t.dataset.erate); t.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === t)); refreshVoucher(); return; }
   if (t.dataset.edel) { V.extras.splice(Number(t.dataset.edel), 1); renderVoucher(); return; }
+  if (t.dataset.hmode) { histMode = t.dataset.hmode; renderHistory(); return; }
+  if (t.dataset.period) { setPeriod(t.dataset.period); renderHistory(); return; }
+  if (t.dataset.sby) { SUM.by = t.dataset.sby; SUM.open = {}; renderHistory(); return; }
+  if (t.dataset.sopen !== undefined) { SUM.open[t.dataset.sopen] = !SUM.open[t.dataset.sopen]; renderSummary(); return; }
   if (t.dataset.pdel) { PEND.splice(Number(t.dataset.pdel), 1); renderVoucher(); return; }
   if (t.dataset.oback) {
     const o = V.others.splice(Number(t.dataset.oback), 1)[0];
@@ -732,6 +741,12 @@ document.addEventListener('click', async ev => {
     case 'photo': $('#photoIn').click(); break;
     case 'camera': if (PEND.length >= 6) { toast('写真は6枚までです', true); break; } $('#cameraIn').click(); break;
     case 'readPend': readPhotos(PEND.slice()); break;
+    case 'sumCopy': {
+      const txt = summaryText();
+      (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(() => toast('コピーしました。LINEやメモに貼り付けられます'))
+        .catch(() => openModal(`<h2>集計のテキスト</h2><textarea class="t" rows="14" readonly>${esc(txt)}</textarea><div class="actions"><button class="btn" data-act="close">閉じる</button></div>`));
+      break;
+    }
     case 'clearPend': PEND = []; renderVoucher(); break;
     case 'togglePhoto': V.showPhoto = !V.showPhoto; renderVoucher(); break;
     case 'cancelEdit': C = freshCalc(); renderCalc(); break;
@@ -878,8 +893,77 @@ function renderReview() {
 
 /* ---------------- 履歴タブ ---------------- */
 function renderHistory() {
-  $('#tab-history').innerHTML = `<div class="filters"><input class="t" id="hQ" placeholder="商品名・仕入先で絞り込み" value="${esc(histQuery)}"></div><div id="hList"></div>`;
-  renderHistoryList();
+  let h = `<div class="seg" style="margin-bottom:10px"><button data-hmode="list" class="${histMode === 'list' ? 'on' : ''}">記録の一覧</button><button data-hmode="sum" class="${histMode === 'sum' ? 'on' : ''}">期間で集計</button></div>`;
+  if (histMode === 'list') {
+    $('#tab-history').innerHTML = h + `<div class="filters"><input class="t" id="hQ" placeholder="商品名・仕入先で絞り込み" value="${esc(histQuery)}"></div><div id="hList"></div>`;
+    renderHistoryList();
+    return;
+  }
+  if (!SUM.from) setPeriod('lastYear');
+  h += `<div class="card">
+    <div class="row" style="flex-wrap:wrap;gap:6px">${[['thisYear', '今年'], ['lastYear', '昨年'], ['last12', '直近12か月'], ['riceYear', '昨年10月〜今年9月']].map(([k, l]) => `<button class="btn sub small" style="flex:0 0 auto" data-period="${k}">${l}</button>`).join('')}</div>
+    <div class="row"><div><label class="f">から</label><input class="t" type="date" id="sFrom" value="${SUM.from}"></div><div><label class="f">まで</label><input class="t" type="date" id="sTo" value="${SUM.to}"></div></div>
+    <label class="f">銘柄（名前の一部。空欄ならすべて）</label><input class="t" id="sQ" value="${esc(SUM.q)}" placeholder="例：魚沼、ひとめ">
+    <label class="f">まとめ方</label><div class="seg"><button data-sby="prod" class="${SUM.by === 'prod' ? 'on' : ''}">商品ごと</button><button data-sby="sup" class="${SUM.by === 'sup' ? 'on' : ''}">仕入先ごと</button></div>
+    </div><div id="sOut"></div>`;
+  $('#tab-history').innerHTML = h;
+  renderSummary();
+}
+function setPeriod(k) {
+  const y = Number(today().slice(0, 4));
+  if (k === 'thisYear') { SUM.from = y + '-01-01'; SUM.to = y + '-12-31'; }
+  if (k === 'lastYear') { SUM.from = (y - 1) + '-01-01'; SUM.to = (y - 1) + '-12-31'; }
+  if (k === 'last12') { SUM.from = addDays(today(), -365); SUM.to = today(); }
+  if (k === 'riceYear') { SUM.from = (y - 1) + '-10-01'; SUM.to = y + '-09-30'; }
+}
+/** 期間・銘柄で絞った仕入れを、商品（または仕入先）ごと → その中を仕入先（または商品）ごとに集計する */
+function summarize() {
+  const q = norm(SUM.q);
+  const list = D.entries.filter(e => e.q > 0 && e.d >= SUM.from && e.d <= SUM.to && (!q || norm((prod(e.c) || {}).name).includes(q)));
+  const groups = new Map();
+  list.forEach(e => {
+    const k1 = SUM.by === 'prod' ? e.c : e.s, k2 = SUM.by === 'prod' ? e.s : e.c;
+    if (!groups.has(k1)) groups.set(k1, { key: k1, bags: 0, kg: 0, n: 0, cost: 0, costBags: 0, subs: new Map(), months: {} });
+    const g = groups.get(k1), p = prod(e.c), w = (p && p.weight) || cfg().defW;
+    if (!g.subs.has(k2)) g.subs.set(k2, { key: k2, bags: 0, n: 0, cost: 0, costBags: 0, last: '' });
+    const sub = g.subs.get(k2);
+    [g, sub].forEach(x => { x.bags += e.q; x.n++; if (e.b > 0) { x.cost += e.b * e.q; x.costBags += e.q; } });
+    g.kg += e.q * w;
+    if (e.d > sub.last) sub.last = e.d;
+    const m = e.d.slice(0, 7); g.months[m] = (g.months[m] || 0) + e.q;
+  });
+  const out = [...groups.values()].sort((a, b) => b.bags - a.bags);
+  out.forEach(g => { g.subs = [...g.subs.values()].sort((a, b) => b.bags - a.bags); });
+  return { groups: out, total: list.reduce((a, e) => a + e.q, 0), count: list.length };
+}
+const nameOf = (k, isProd) => isProd ? ((prod(k) || {}).name || '（商品 ' + k + '）') : ((sup(k) || {}).name || '（仕入先 ' + k + '）');
+function renderSummary() {
+  const out = $('#sOut'); if (!out) return;
+  if (SUM.from > SUM.to) { out.innerHTML = '<div class="empty">期間の「から」と「まで」が逆です</div>'; return; }
+  const r = summarize(), pBy = SUM.by === 'prod';
+  if (!r.groups.length) { out.innerHTML = '<div class="empty">この期間・銘柄の仕入れはありません</div>'; return; }
+  let h = `<div class="row" style="margin:4px 0 8px"><div class="muted grow">${esc(SUM.from)} 〜 ${esc(SUM.to)}　合計 <b style="color:var(--ink)">${fmt(r.total)}袋</b>（${r.count}回）</div>
+    <button class="btn sub small" style="flex:0 0 auto" data-act="sumCopy">テキストでコピー</button></div>`;
+  r.groups.forEach(g => {
+    const open = SUM.open[g.key];
+    h += `<div class="card"><div class="row"><b class="grow">${esc(nameOf(g.key, pBy))}</b><b style="flex:0 0 auto">${fmt(g.bags)}袋</b></div>
+      <div class="muted">${g.n}回${pBy ? `・${fmt(g.kg)}kg` : ''}${g.costBags ? `・平均 1袋 ${yen(g.cost / g.costBags)}` : ''}</div>
+      <table class="prices" style="margin-top:4px"><tr><th>${pBy ? '仕入先' : '商品'}</th><th>袋</th><th>回</th><th>平均 1袋</th><th>最後</th></tr>
+      ${g.subs.map(x => `<tr><td style="white-space:normal;font-weight:400">${esc(nameOf(x.key, !pBy))}</td><td>${fmt(x.bags)}</td><td>${x.n}</td><td>${x.costBags ? yen(x.cost / x.costBags) : '—'}</td><td>${esc(x.last.slice(5).replace('-', '/'))}</td></tr>`).join('')}</table>
+      <button class="linkbtn" data-sopen="${esc(g.key)}">${open ? '月別を閉じる' : '月別の内訳を見る'}</button>
+      ${open ? '<div class="muted">' + Object.keys(g.months).sort().map(m => `${Number(m.slice(5))}月 ${fmt(g.months[m])}袋`).join('　') + '</div>' : ''}</div>`;
+  });
+  out.innerHTML = h;
+}
+function summaryText() {
+  const r = summarize(), pBy = SUM.by === 'prod';
+  const lines = [`仕入れ集計 ${SUM.from}〜${SUM.to}${SUM.q ? '（' + SUM.q + '）' : ''}　合計 ${fmt(r.total)}袋`];
+  r.groups.forEach(g => {
+    lines.push('', `■ ${nameOf(g.key, pBy)}　${fmt(g.bags)}袋（${g.n}回）`);
+    g.subs.forEach(x => lines.push(`・${nameOf(x.key, !pBy)}　${fmt(x.bags)}袋（${x.n}回）${x.costBags ? '　平均 ' + yen(x.cost / x.costBags) : ''}`));
+    lines.push('  月別：' + Object.keys(g.months).sort().map(m => `${Number(m.slice(5))}月 ${fmt(g.months[m])}`).join('、'));
+  });
+  return lines.join('\n');
 }
 function renderHistoryList() {
   const q = norm(histQuery);

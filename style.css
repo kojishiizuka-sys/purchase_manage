@@ -30,7 +30,7 @@ main { max-width: 720px; margin: 0 auto; padding: 12px; }
 h2 { font-size: 16px; margin: 4px 0 10px; }
 .muted { color: var(--sub); font-size: 13px; }
 .row { display: flex; gap: 8px; align-items: center; }
-.row > * { flex: 1; }
+.row > * { flex: 1; min-width: 0; }
 .grow { flex: 1; }
 
 .seg { display: flex; border: 1px solid var(--main); border-radius: 10px; overflow: hidden; }
