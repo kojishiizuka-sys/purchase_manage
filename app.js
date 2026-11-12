@@ -1,7 +1,7 @@
 /* 仕入れ・売価 アプリ本体 */
 'use strict';
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 const LS = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 保存できなくても動く */ } }
