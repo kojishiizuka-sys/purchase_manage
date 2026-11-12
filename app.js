@@ -1,7 +1,7 @@
 /* 仕入れ・売価 アプリ本体 */
 'use strict';
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const LS = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 保存できなくても動く */ } }
@@ -29,6 +29,7 @@ let D = LS.get('shiire-data', null);   // サーバーから受け取った全�
 let tab = 'calc';
 let C = freshCalc();                   // 計算・入力タブの入力中の内容
 let busy = false;
+let lastTiming = null;               // 直前の通信にかかった時間（遅いときの原因調べ用）
 let histQuery = '', prodQuery = '', prodAll = false;
 
 function freshCalc(keep) {
@@ -106,7 +107,7 @@ function reviewOf(p) {
 async function api(action, payload) {
   if (!conf.apiUrl || !conf.pass) { openSettings(); throw new Error('設定画面でサーバーURLと合言葉を入れてください'); }
   setSync('通信中…');
-  let res;
+  let res; const t0 = Date.now();
   try {
     const r = await fetch(conf.apiUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(Object.assign({ pass: conf.pass, action, by: conf.name || '' }, payload || {})) });
@@ -117,7 +118,9 @@ async function api(action, payload) {
   }
   if (!res.ok) { setSync(''); if (res.auth) openSettings(); throw new Error(res.error || 'エラーが起きました'); }
   if (res.data) { D = res.data; LS.set('shiire-data', D); }
-  setSync('最新 ' + (D && D.serverTime ? D.serverTime.slice(11) : ''));
+  const sec = ((Date.now() - t0) / 1000).toFixed(1);
+  lastTiming = { action, total: sec, server: res.ms != null ? (res.ms / 1000).toFixed(1) : '?' };
+  setSync('最新 ' + (D && D.serverTime ? D.serverTime.slice(11) : '') + (action !== 'load' ? `（${sec}秒）` : ''));
   return res;
 }
 function setSync(t) { $('#syncState').textContent = t; }
@@ -835,7 +838,8 @@ function openSettings() {
     <label class="f">サーバーURL（Apps Script のウェブアプリURL）</label><input class="t" id="st_url" value="${esc(conf.apiUrl)}" placeholder="https://script.google.com/macros/s/…/exec">
     <label class="f">合言葉</label><input class="t" id="st_pass" value="${esc(conf.pass || '')}" inputmode="numeric">
     <label class="f">あなたの名前（記録に残ります）</label><input class="t" id="st_name" value="${esc(conf.name || '')}">
-    <p class="muted">最終バックアップ：${esc((D && D.lastBackup) || 'まだありません')}<br>バージョン ${VERSION}</p>
+    <p class="muted">最終バックアップ：${esc((D && D.lastBackup) || 'まだありません')}<br>バージョン ${VERSION}
+    ${lastTiming ? `<br>直前の通信（${esc(lastTiming.action)}）：全体 ${lastTiming.total}秒、うちサーバーの処理 ${lastTiming.server}秒` : ''}</p>
     <div class="actions"><button class="btn sub" data-act="close">閉じる</button><button class="btn" id="okSet">保存して読み込む</button></div>`);
   $('#okSet').onclick = () => {
     conf.apiUrl = $('#st_url').value.trim(); conf.pass = $('#st_pass').value.trim(); conf.name = $('#st_name').value.trim();
